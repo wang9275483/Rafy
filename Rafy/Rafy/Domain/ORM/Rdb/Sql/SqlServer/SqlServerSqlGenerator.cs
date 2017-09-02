@@ -21,6 +21,14 @@ namespace Rafy.Domain.ORM
 {
     class SqlServerSqlGenerator : SqlGenerator
     {
+        /// <summary>
+        /// Sql Server 中没有限制 In 语句中的项的个数。（但是如果使用参数的话，则最多只能使用 2000 个参数。）
+        /// 
+        /// In 语句中可以承受的最大的个数。
+        /// 如果超出这个个数，则会抛出 TooManyItemsInInClauseException。
+        /// </summary>
+        protected override int MaxItemsInInClause => int.MaxValue;
+
         protected override void QuoteAppend(string identifier)
         {
             if (this.AutoQuota)
@@ -47,9 +55,6 @@ namespace Rafy.Domain.ORM
         /// <returns></returns>
         protected override ISqlSelect ModifyToPagingTree(SqlSelect raw, PagingInfo pagingInfo)
         {
-            if (PagingInfo.IsNullOrEmpty(pagingInfo)) { throw new ArgumentNullException("pagingInfo"); }
-            if (!raw.HasOrdered()) { throw new InvalidProgramException("必须排序后才能使用分页功能。"); }
-
             //如果是第一页，则只需要使用 TOP 语句即可。
             if (pagingInfo.PageNumber == 1)
             {
@@ -66,7 +71,7 @@ namespace Rafy.Domain.ORM
                 };
             }
 
-            return this.ModifyToPagingTreeWithNotIn(raw, pagingInfo);
+            return this.ModifyToPagingTree_With_RowNumber(raw, pagingInfo);
         }
 
         /// <summary>
@@ -75,7 +80,7 @@ namespace Rafy.Domain.ORM
         /// <param name="raw">原始查询</param>
         /// <param name="pagingInfo">分页信息。</param>
         /// <returns></returns>
-        private ISqlSelect ModifyToPagingTreeWithNotIn(SqlSelect raw, PagingInfo pagingInfo)
+        private ISqlSelect ModifyToPagingTree_With_NotIn(SqlSelect raw, PagingInfo pagingInfo)
         {
             /*********************** 代码块解释 *********************************
              * 
@@ -130,6 +135,7 @@ namespace Rafy.Domain.ORM
                 OrderBy = raw.OrderBy,
             };
 
+            //where
             var newWhere = new SqlColumnConstraint
             {
                 Column = pkColumn,
@@ -159,11 +165,12 @@ namespace Rafy.Domain.ORM
         /// <param name="raw">原始查询</param>
         /// <param name="pagingInfo">分页信息。</param>
         /// <returns></returns>
-        private ISqlSelect ModifyToPagingTreeWithRowNumberOver(SqlSelect raw, PagingInfo pagingInfo)
+        private ISqlSelect ModifyToPagingTree_With_RowNumber(SqlSelect raw, PagingInfo pagingInfo)
         {
             /*********************** 代码块解释 *********************************
              * 
              * 转换方案：
+             * 使用 ROW_NUMBER() 函数。（此函数 SqlServer、Oracle 都可使用。）
              * 
              * SELECT * 
              * FROM ASN
@@ -174,20 +181,45 @@ namespace Rafy.Domain.ORM
              * 
              * SELECT * FROM
              * (
-             *     SELECT A.*, ROW_NUMBER() OVER (order by  Id)_rowNumber
+             *     SELECT A.*, ROW_NUMBER() OVER (order by  Id) _RowNumber
              *     FROM  A
              * ) T
-             * WHERE _rowNumber between 1 and 10
+             * WHERE _RowNumber BETWEEN 1 AND 10
             **********************************************************************/
+
+            var finder = new FirstTableFinder();
+            var pkTable = finder.Find(raw.From);
+
+            //在 Sql 分页的算法中，必须排序后才能使用分页功能，所以如果给定的 sql 中没有排序语句的话，则尝试使用任意表的一个默认的字段（Id）来进行排序。
+            var orderBy = raw.OrderBy;
+            if (!raw.HasOrdered())
+            {
+                if (SqlServerSqlGeneratorConfiguration.DefaultPagingSqlOrderbyColumn == null)
+                {
+                    throw new InvalidProgramException("必须提供排序语句后，才能使用分页功能。");
+                }
+
+                orderBy = new SqlOrderByList
+                {
+                    new SqlOrderBy
+                    {
+                        Column = new SqlColumn
+                        {
+                            Table = pkTable,
+                            ColumnName = SqlServerSqlGeneratorConfiguration.DefaultPagingSqlOrderbyColumn
+                        }
+                    }
+                };
+            }
 
             var newRaw = new SqlSelect
             {
                 Selection = new SqlNodeList()
                 {
-                    new SqlLiteral { FormattedSql = "ROW_NUMBER() OVER (" },
-                    raw.OrderBy,
-                    new SqlLiteral { FormattedSql = ") _rowNumber," },
-                    raw.Selection ?? SqlSelectAll.Default
+                    raw.Selection ?? new SqlSelectAll() { Table = pkTable },
+                    new SqlLiteral { FormattedSql = ", ROW_NUMBER() OVER (" },
+                    orderBy,
+                    new SqlLiteral { FormattedSql = ") _RowNumber " }
                 },
                 From = raw.From,
                 Where = raw.Where,
@@ -199,12 +231,12 @@ namespace Rafy.Domain.ORM
 
             var res = new SqlNodeList
             {
-                                new SqlLiteral(
+                new SqlLiteral(
                 @"SELECT * FROM
 ("),
-                                newRaw,
-                                new SqlLiteral(
-                @")T WHERE _rowNumber BETWEEN " + startRow + @" AND " +endRow )
+                newRaw,
+                new SqlLiteral(
+                @")T WHERE _RowNumber BETWEEN " + startRow + @" AND " +endRow )
             };
 
             return res;
